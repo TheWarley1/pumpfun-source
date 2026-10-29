@@ -27,15 +27,67 @@ const statWindow = {
   distribution: { under2x: 2, twoToFiveX: 2 },
 };
 
+/** A row that satisfies the documented callout shape, used where conformance matters. */
+const legacyCallout = (calloutId: string, userId: string, coinMint: string, createdAt: string) => ({
+  calloutId,
+  userId,
+  coinMint,
+  marketCap: 0,
+  calloutPrice: 0,
+  calloutPriceUsd: 0,
+  multiple: 0,
+  createdAt,
+  maxPriceSol: 0,
+  maxPriceUsd: 0,
+  user_uuid: userId,
+  likes: 0,
+  hasLiked: false,
+  hasReposted: false,
+  repostCount: 0,
+  quoteCount: 0,
+  updates: [],
+  updateCount: 0,
+  commentCount: 0,
+  replyCount: 0,
+  maxMultiplier: 0,
+  maxMultiplierAt: null,
+  mediaUrl: null,
+  quotedCalloutId: null,
+  quotedCallout: null,
+});
+
+const tailerRow = (walletAddress: string) => ({
+  profile: null,
+  walletAddress,
+  chainId: 56,
+  firstSeenAt: null,
+  pnl1hUsd: 0,
+  pnl4hUsd: 0,
+  pnl24hUsd: 0,
+  ath1hUsd: 0,
+  ath4hUsd: 0,
+  ath24hUsd: 0,
+  positionUsd: 0,
+  amountHeld: 0,
+  pnlUsd: 0,
+  isExited: false,
+});
+
+const replyRow = (replyId: string, calloutId: string, userId: string, createdAt: string) => ({
+  callout: null,
+  parent: null,
+  reply: { replyId, calloutId, userId, createdAt },
+});
+
 const dataset = {
   schemaVersion: 1 as const,
   dataSource: "synthetic" as const,
   observedAt: "2026-10-29T00:00:00.000Z",
   coinCallouts: {
-    "so111": [
-      { calloutId: "c1", userId: "u1", coinMint: "So111", createdAt: "2026-10-20T00:00:00Z" },
-      { calloutId: "c2", userId: "u2", coinMint: "So111", createdAt: "2026-10-21T00:00:00Z" },
-      { calloutId: "c3", userId: "u3", coinMint: "So111", createdAt: "2026-10-22T00:00:00Z" },
+    so111: [
+      legacyCallout("c1", "u1", "So111", "2026-10-20T00:00:00Z"),
+      legacyCallout("c2", "u2", "So111", "2026-10-21T00:00:00Z"),
+      legacyCallout("c3", "u3", "So111", "2026-10-22T00:00:00Z"),
     ],
   },
   leaderboardStats: {
@@ -43,8 +95,8 @@ const dataset = {
   },
   repliesByUser: {
     u1: [
-      { replyId: "r1", calloutId: "c1", userId: "u1", createdAt: "2026-10-20T01:00:00Z" },
-      { replyId: "r2", calloutId: "c1", userId: "u1", createdAt: "2026-10-20T02:00:00Z" },
+      replyRow("r1", "c1", "u1", "2026-10-20T01:00:00Z"),
+      replyRow("r2", "c1", "u1", "2026-10-20T02:00:00Z"),
     ],
   },
   repostsByUser: {
@@ -57,7 +109,7 @@ const dataset = {
     c1: {
       likers: [{ userId: "u2" }, { userId: "u3" }],
       reposters: [{ userId: "u3" }],
-      tailers: [{ walletAddress: "0xabc", chainId: 56 }],
+      tailers: [tailerRow("0xabc")],
       quotes: [{ replyId: "q1" }],
     },
   },
@@ -97,10 +149,17 @@ describe("callout engagement routes return their documented envelopes", () => {
     assert.ok("weekly" in body && "monthly" in body);
   });
 
-  test("GET /v1/callout/replies/list/{userId} answers with replies", async () => {
+  test("GET /v1/callout/replies/list/{userId} answers with the documented triple", async () => {
     const res = await app().inject({ method: "GET", url: "/v1/callout/replies/list/u1" });
     assert.equal(res.statusCode, 200);
-    assert.equal(res.json().replies.length, 2);
+    const { replies } = res.json();
+    assert.equal(replies.length, 2);
+    for (const row of replies) {
+      for (const key of ["callout", "parent", "reply"]) {
+        assert.ok(key in row, `reply row carries ${key}`);
+      }
+      assert.equal(typeof row.reply.replyId, "string");
+    }
   });
 
   test("GET /v1/callout/reposts/list/{userId} answers with reposts and a cursor", async () => {
@@ -149,23 +208,94 @@ describe("callout engagement routes return their documented envelopes", () => {
   });
 });
 
+describe("inherited object keys are not dataset rows", () => {
+  const hostile = ["constructor", "toString", "__proto__", "hasOwnProperty", "valueOf"];
+
+  test("every lookup answers 404 for an inherited key, never 200 and never 500", async () => {
+    for (const key of hostile) {
+      const urls = [
+        `/v1/callout/coin/${key}`,
+        `/v1/callout/leaderboard-stats/${key}`,
+        `/v1/callout/replies/list/${key}`,
+        `/v1/callout/reposts/list/${key}`,
+        `/v1/users/${key}/callout-stats`,
+      ];
+      for (const url of urls) {
+        const res = await app().inject({ method: "GET", url });
+        assert.equal(res.statusCode, 404, `${key} ${url}`);
+        assert.equal(res.json().error, "NOT_FOUND", `${key} ${url}`);
+      }
+      for (const suffix of ["likers", "reposters", "tailers", "quotes"]) {
+        const res = await app().inject({ method: "GET", url: `/v1/callout/${key}/${suffix}` });
+        assert.equal(res.statusCode, 404, `${key} ${suffix}`);
+      }
+    }
+  });
+});
+
+describe("documented parameter bounds are enforced per operation", () => {
+  test("the coin limit ceiling of 100 is enforced, not just the lower bound", async () => {
+    const over = await app().inject({ method: "GET", url: "/v1/callout/coin/so111?limit=101" });
+    assert.equal(over.statusCode, 400);
+    assert.equal(over.json().reason, "Q_PAGE_LIMIT");
+
+    const huge = await app().inject({
+      method: "GET",
+      url: "/v1/callout/coin/so111?limit=100000000000000",
+    });
+    assert.equal(huge.statusCode, 400);
+
+    const atCeiling = await app().inject({ method: "GET", url: "/v1/callout/coin/so111?limit=100" });
+    assert.equal(atCeiling.statusCode, 200);
+  });
+
+  test("offset is a 501 on the two operations that do not document it", async () => {
+    for (const url of ["/v1/callout/coin/so111?offset=1", "/v1/callout/replies/list/u1?offset=1"]) {
+      const res = await app().inject({ method: "GET", url });
+      assert.equal(res.statusCode, 501, url);
+      assert.equal(res.json().error, "COMPATIBILITY_NOT_IMPLEMENTED", url);
+    }
+  });
+
+  test("offset stays supported where the contract does document it", async () => {
+    const res = await app().inject({ method: "GET", url: "/v1/callout/c1/likers?offset=1" });
+    assert.equal(res.statusCode, 200);
+    assert.equal(res.json().likers.length, 1);
+  });
+});
+
 describe("the store owns an immutable, pre-validated snapshot", () => {
   const base = () => JSON.parse(JSON.stringify(dataset));
 
   test("a malformed reply row is rejected at construction, not at request time", () => {
     const broken = base();
-    broken.repliesByUser.u1 = [{}, { replyId: "r9" }];
+    broken.repliesByUser.u1 = [{}, replyRow("r9", "c1", "u1", "2026-10-20T00:00:00Z")];
     assert.throws(() => new CalloutEngagementStore(broken), /repliesByUser/);
+
+    const missingInner = base();
+    missingInner.repliesByUser.u1 = [{ callout: null, parent: null }];
+    assert.throws(() => new CalloutEngagementStore(missingInner), /repliesByUser/);
 
     const nullRow = base();
     nullRow.repliesByUser.u1 = [null];
     assert.throws(() => new CalloutEngagementStore(nullRow), /repliesByUser/);
 
     const badStamp = base();
-    badStamp.repliesByUser.u1 = [
-      { replyId: "r1", calloutId: "c1", userId: "u1", createdAt: "yesterday" },
-    ];
+    badStamp.repliesByUser.u1 = [replyRow("r1", "c1", "u1", "yesterday")];
     assert.throws(() => new CalloutEngagementStore(badStamp), /ISO 8601/);
+  });
+
+  test("a coin row missing a documented field is rejected at construction", () => {
+    const thin = base();
+    const row = thin.coinCallouts.so111[0];
+    delete (row as Record<string, unknown>).maxMultiplierAt;
+    assert.throws(() => new CalloutEngagementStore(thin), /maxMultiplierAt/);
+  });
+
+  test("a tailer row missing a documented field is rejected at construction", () => {
+    const thin = base();
+    delete (thin.calloutLists.c1.tailers[0] as Record<string, unknown>).isExited;
+    assert.throws(() => new CalloutEngagementStore(thin), /isExited/);
   });
 
   test("a malformed repost row and a malformed leaderboard row are rejected too", () => {

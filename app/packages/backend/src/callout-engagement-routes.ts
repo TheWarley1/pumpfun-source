@@ -32,9 +32,9 @@ export const CALLOUT_ENGAGEMENT_NATIVE_ROUTES = new Set([
 
 /** Query keys each operation models, so an unknown key can be answered honestly. */
 const SUPPORTED_QUERY: Record<string, readonly string[]> = {
-  coin: ["limit", "offset"],
+  coin: ["limit"],
   leaderboard: [],
-  repliesByUser: ["limit", "offset", "beforeId"],
+  repliesByUser: ["limit", "beforeId"],
   replyList: ["limit", "offset"],
   reposts: ["limit", "cursor", "includeQuotes"],
   calloutList: ["limit", "offset"],

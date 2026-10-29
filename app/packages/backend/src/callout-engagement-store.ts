@@ -13,6 +13,36 @@
  */
 import { readFileSync, statSync } from "node:fs";
 
+/**
+ * Required fields of the three item shapes this materialization returns, read
+ * from the published contract rather than restated by hand. A dataset row that
+ * cannot satisfy the documented envelope is rejected at boot.
+ */
+const spec = JSON.parse(
+  readFileSync(new URL("../../../contracts/developer.openapi.json", import.meta.url), "utf8"),
+) as {
+  paths: Record<string, { get: { responses: Record<string, { content: Record<string, { schema: Record<string, unknown> }> } > } }>;
+};
+
+function itemRequired(path: string, property: string): string[] {
+  const schema = spec.paths[path].get.responses["200"].content["application/json"].schema as {
+    properties: Record<string, { items?: { required?: string[] } }>;
+  };
+  return schema.properties[property].items?.required ?? [];
+}
+
+const REQUIRED = {
+  callout: itemRequired("/callout/coin/{coin}", "callouts"),
+  replyItem: itemRequired("/callout/replies/list/{userId}", "replies"),
+  tailer: itemRequired("/callout/{calloutId}/tailers", "tailers"),
+} as const;
+
+function requireFields(row: Record<string, unknown>, fields: readonly string[], label: string): void {
+  for (const field of fields) {
+    if (!Object.hasOwn(row, field)) throw new Error(`${label} is missing the documented field ${field}`);
+  }
+}
+
 export type EngagementListKey = "likers" | "reposters" | "tailers" | "quotes";
 
 export interface CoinCallout {
@@ -24,12 +54,19 @@ export interface CoinCallout {
   [key: string]: unknown;
 }
 
-export interface CalloutReply {
+export interface CalloutReplyFacts {
   replyId: string;
   calloutId: string;
   userId: string;
-  parentReplyId?: string | null;
   createdAt: string;
+  [key: string]: unknown;
+}
+
+/** The documented row is the triple, not a bare reply. */
+export interface CalloutReplyRow {
+  callout: unknown;
+  parent: unknown;
+  reply: CalloutReplyFacts;
   [key: string]: unknown;
 }
 
@@ -83,7 +120,7 @@ export interface CalloutEngagementDataset {
   observedAt: string;
   coinCallouts: Record<string, CoinCallout[]>;
   leaderboardStats: Record<string, LeaderboardStats>;
-  repliesByUser: Record<string, CalloutReply[]>;
+  repliesByUser: Record<string, CalloutReplyRow[]>;
   repostsByUser: Record<string, CalloutRepost[]>;
   calloutLists: Record<string, Partial<Record<EngagementListKey, unknown[]>>>;
   replyLists: Record<string, Partial<Record<"likers" | "reposters", unknown[]>>>;
@@ -183,18 +220,18 @@ export function assertCalloutEngagementDataset(
   for (const [coin, rows] of Object.entries(coinCallouts)) {
     for (const row of requireArray(rows, `coinCallouts.${coin}`)) {
       const entry = requireRecord(row, "coinCallouts row");
-      if (typeof entry.calloutId !== "string" || typeof entry.userId !== "string") {
-        throw new Error("coinCallouts rows need calloutId and userId");
-      }
+      requireFields(entry, REQUIRED.callout, `coinCallouts.${coin}`);
       requireTimestamp(entry, "createdAt", `coinCallouts.${coin}`);
     }
   }
 
   requireRows(root.repliesByUser, "repliesByUser", (row, at) => {
-    requireString(row, "replyId", at);
-    requireString(row, "calloutId", at);
-    requireString(row, "userId", at);
-    requireTimestamp(row, "createdAt", at);
+    requireFields(row, REQUIRED.replyItem, at);
+    const inner = requireRecord(row.reply, `${at}.reply`);
+    requireString(inner, "replyId", `${at}.reply`);
+    requireString(inner, "calloutId", `${at}.reply`);
+    requireString(inner, "userId", `${at}.reply`);
+    requireTimestamp(inner, "createdAt", `${at}.reply`);
   });
   requireRows(root.repostsByUser, "repostsByUser", (row, at) => {
     requireString(row, "id", at);
@@ -218,7 +255,15 @@ export function assertCalloutEngagementDataset(
   for (const [id, lists] of Object.entries(calloutLists)) {
     const entry = requireRecord(lists, `calloutLists.${id}`);
     for (const [key, rows] of Object.entries(entry)) {
-      requireArray(rows, `calloutLists.${id}.${key}`);
+      const list = requireArray(rows, `calloutLists.${id}.${key}`);
+      if (key !== "tailers") continue;
+      list.forEach((row, index) => {
+        requireFields(
+          requireRecord(row, `calloutLists.${id}.tailers[${index}]`),
+          REQUIRED.tailer,
+          `calloutLists.${id}.tailers[${index}]`,
+        );
+      });
     }
   }
   const replyLists = requireRecord(root.replyLists, "replyLists");
@@ -252,6 +297,16 @@ export interface PageQuery {
 const MAX_SAFE = Number.MAX_SAFE_INTEGER;
 
 /**
+ * Read a dataset row by an exact, own property only. A request path segment is
+ * attacker-controlled, and a plain `map[key]` answers names inherited from
+ * Object.prototype, so `constructor` or `__proto__` would otherwise resolve as
+ * a row and produce either a fabricated 200 or a TypeError out of the route.
+ */
+function own<T>(map: Record<string, T>, key: string): T | undefined {
+  return Object.hasOwn(map, key) ? map[key] : undefined;
+}
+
+/**
  * The store owns its data. Both directions are detached: the accepted snapshot
  * is cloned on the way in, so a caller cannot mutate a validated dataset after
  * construction, and every row handed out is cloned on the way out, so a caller
@@ -268,7 +323,7 @@ export class CalloutEngagementStore {
   private readonly coinCallouts: Record<string, CoinCallout[]>;
   private readonly coinCalloutsFold: Record<string, CoinCallout[]>;
   private readonly leaderboard: Record<string, LeaderboardStats>;
-  private readonly repliesByUser: Record<string, CalloutReply[]>;
+  private readonly repliesByUser: Record<string, CalloutReplyRow[]>;
   private readonly repostsByUser: Record<string, CalloutRepost[]>;
   private readonly calloutLists: Record<string, Partial<Record<EngagementListKey, unknown[]>>>;
   private readonly replyLists: Record<string, Partial<Record<"likers" | "reposters", unknown[]>>>;
@@ -298,9 +353,15 @@ export class CalloutEngagementStore {
   }
 
   /** Page a row list, rejecting an out-of-range limit or offset rather than clamping. */
-  private page<T>(rows: T[], query: PageQuery): { rows: T[]; hasMore: boolean } {
+  private page<T>(
+    rows: T[],
+    query: PageQuery,
+    maxLimit: number = MAX_SAFE,
+  ): { rows: T[]; hasMore: boolean } {
     const limit = query.limit ?? 20;
-    if (!Number.isInteger(limit) || limit < 1 || limit > MAX_SAFE) {
+    // The contract bounds `limit` per operation, so the ceiling is a parameter
+    // rather than one store-wide value.
+    if (!Number.isInteger(limit) || limit < 1 || limit > maxLimit) {
       throw new CalloutEngagementError(400, "Q_PAGE_LIMIT");
     }
     const offset = query.offset ?? 0;
@@ -314,28 +375,27 @@ export class CalloutEngagementStore {
   coinCalloutList(coin: string, query: PageQuery): { callouts: CoinCallout[] } {
     // Mint identifiers are case-sensitive in base58, so an exact key wins. The
     // case-folded lookup is only a fallback and only when it is unambiguous.
-    const rows =
-      this.coinCallouts[coin] ??
-      this.coinCalloutsFold[coin.toLowerCase()] ??
-      undefined;
+    const rows = own(this.coinCallouts, coin) ?? own(this.coinCalloutsFold, coin.toLowerCase());
     if (!rows) throw new CalloutEngagementError(404, "NOT_FOUND");
-    const { rows: page } = this.page(rows, query);
+    const { rows: page } = this.page(rows, query, 100);
     return { callouts: detach(page) };
   }
 
   leaderboardStats(userId: string): LeaderboardStats {
-    const row = this.leaderboard[userId];
+    const row = own(this.leaderboard, userId);
     if (!row) throw new CalloutEngagementError(404, "NOT_FOUND");
     return detach(row);
   }
 
-  repliesForUser(userId: string, query: PageQuery): { replies: CalloutReply[] } {
-    const rows = this.repliesByUser[userId];
+  repliesForUser(userId: string, query: PageQuery): { replies: CalloutReplyRow[] } {
+    const rows = own(this.repliesByUser, userId);
     if (!rows) throw new CalloutEngagementError(404, "NOT_FOUND");
     if (query.filter !== undefined) throw new CalloutEngagementError(400, "Q_FILTER");
-    const sorted = [...rows].sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+    const sorted = [...rows].sort((a, b) =>
+      b.reply.createdAt.localeCompare(a.reply.createdAt),
+    );
     const filtered = query.beforeId
-      ? sorted.filter((row) => row.replyId < query.beforeId!)
+      ? sorted.filter((row) => row.reply.replyId < query.beforeId!)
       : sorted;
     const { rows: page } = this.page(filtered, query);
     return { replies: detach(page) };
@@ -345,7 +405,7 @@ export class CalloutEngagementStore {
     userId: string,
     query: PageQuery,
   ): { reposts: CalloutRepost[]; nextCursor: string | null } {
-    const rows = this.repostsByUser[userId];
+    const rows = own(this.repostsByUser, userId);
     if (!rows) throw new CalloutEngagementError(404, "NOT_FOUND");
     if (query.cursor !== undefined && !/^(0|[1-9]\d*)$/.test(query.cursor)) {
       throw new CalloutEngagementError(400, "Q_PAGE_CURSOR");
@@ -360,25 +420,25 @@ export class CalloutEngagementStore {
   }
 
   calloutList(calloutId: string, key: EngagementListKey, query: PageQuery) {
-    const lists = this.calloutLists[calloutId];
+    const lists = own(this.calloutLists, calloutId);
     if (!lists) throw new CalloutEngagementError(404, "NOT_FOUND");
-    const rows = lists[key];
+    const rows = own(lists as Record<string, unknown[]>, key);
     if (!rows) throw new CalloutEngagementError(404, "NOT_FOUND");
     const { rows: page, hasMore } = this.page(rows, query);
     return { [key]: detach(page), hasMore } as Record<string, unknown>;
   }
 
   replyList(replyId: string, key: "likers" | "reposters", query: PageQuery) {
-    const lists = this.replyLists[replyId];
+    const lists = own(this.replyLists, replyId);
     if (!lists) throw new CalloutEngagementError(404, "NOT_FOUND");
-    const rows = lists[key];
+    const rows = own(lists as Record<string, unknown[]>, key);
     if (!rows) throw new CalloutEngagementError(404, "NOT_FOUND");
     const { rows: page, hasMore } = this.page(rows, query);
     return { [key]: detach(page), hasMore } as Record<string, unknown>;
   }
 
   statsFor(address: string): CalloutStats {
-    const row = this.calloutStats[address.toLowerCase()] ?? this.calloutStats[address];
+    const row = own(this.calloutStats, address) ?? own(this.calloutStats, address.toLowerCase());
     if (!row) throw new CalloutEngagementError(404, "NOT_FOUND");
     return detach(row);
   }
