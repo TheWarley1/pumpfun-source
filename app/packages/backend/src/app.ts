@@ -1,5 +1,7 @@
 import { CALLOUT_DISCUSSIONS_NATIVE_ROUTES, registerCalloutDiscussionRoutes } from "./callout-discussions-routes.js";
 import type { CalloutDiscussionsStore } from "./callout-discussions-store.js";
+import { CALLOUT_ENGAGEMENT_NATIVE_ROUTES, registerCalloutEngagementRoutes } from "./callout-engagement-routes.js";
+import type { CalloutEngagementStore } from "./callout-engagement-store.js";
 import Fastify from "fastify";
 import { CALLOUTS_NATIVE_ROUTES, registerCalloutRoutes } from "./callouts-routes.js";
 import type { CalloutsStore } from "./callouts-store.js";
@@ -312,6 +314,8 @@ export interface BuildAppOptions {
   /** Explicit server-owned public callout materialization; absent retains fixture/501 behavior. */
   calloutsStore?: CalloutsStore;
   calloutDiscussionsStore?: CalloutDiscussionsStore;
+  /** Opt-in materialization for the callout engagement and stats operations. */
+  calloutEngagementStore?: CalloutEngagementStore;
   /** Explicit local materialization; absent preserves the fixture/501 harness. */
   positionsStore?: PositionsStore;
   /** Explicit confirmed-payout facts; absent preserves fixture/501 behavior. */
@@ -409,6 +413,7 @@ export function buildApp(fixtures: Fixture[] = [], opts: BuildAppOptions = {}) {
     registerLeaderboardRoutes(native, lbStore);
     if (opts.calloutsStore) registerCalloutRoutes(native, opts.calloutsStore);
     if (opts.calloutDiscussionsStore) registerCalloutDiscussionRoutes(native, opts.calloutDiscussionsStore);
+    if (opts.calloutEngagementStore) registerCalloutEngagementRoutes(native, opts.calloutEngagementStore);
     if (opts.positionsStore) registerPositionsRoutes(native, opts.positionsStore);
     if (opts.payoutsStore) registerPayoutRoutes(native, opts.payoutsStore);
     if (opts.userTradesStore) registerUserTradesRoutes(native, opts.userTradesStore);
@@ -427,6 +432,7 @@ export function buildApp(fixtures: Fixture[] = [], opts: BuildAppOptions = {}) {
         (opts.portfolioBalancesStore && PORTFOLIO_BALANCES_NATIVE_ROUTES.has(`${method.toUpperCase()} ${path}`)) ||
         (opts.calloutDiscussionsStore && CALLOUT_DISCUSSIONS_NATIVE_ROUTES.has(`${method.toUpperCase()} ${path}`)) ||
         (opts.calloutsStore && CALLOUTS_NATIVE_ROUTES.has(`${method.toUpperCase()} ${path}`)) ||
+        (opts.calloutEngagementStore && CALLOUT_ENGAGEMENT_NATIVE_ROUTES.has(`${method.toUpperCase()} ${path}`)) ||
         (opts.positionsStore && POSITIONS_NATIVE_ROUTES.has(`${method.toUpperCase()} ${path}`)) ||
         (opts.payoutsStore && PAYOUTS_NATIVE_ROUTES.has(`${method.toUpperCase()} ${path}`)) ||
         (opts.userTradesStore && USER_TRADES_NATIVE_ROUTES.has(`${method.toUpperCase()} ${path}`))) continue;
