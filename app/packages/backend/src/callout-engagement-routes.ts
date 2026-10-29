@@ -150,7 +150,9 @@ export function registerCalloutEngagementRoutes(
       return send(reply, store, {
         userId: stats.userId ?? userId,
         snapshotAt: stats.snapshotAt,
-        user_uuid: stats.userId ?? userId,
+        // The documented field is user_uuid; honour an explicit value from the
+        // dataset rather than always deriving it from the path parameter.
+        user_uuid: (stats.user_uuid as string | undefined) ?? stats.userId ?? userId,
         weekly: stats.weekly ?? null,
         monthly: stats.monthly ?? null,
         bestRank: stats.bestRank ?? null,

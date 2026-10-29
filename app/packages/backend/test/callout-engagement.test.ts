@@ -140,6 +140,17 @@ describe("callout engagement routes return their documented envelopes", () => {
     assert.equal(res.headers["x-reconstruction-data-source"], "synthetic");
   });
 
+  test("leaderboard-stats honours an explicit user_uuid from the dataset", async () => {
+    const withUuid = JSON.parse(JSON.stringify(dataset));
+    withUuid.leaderboardStats.u1.user_uuid = "uuid-from-dataset";
+    const custom = buildApp([], {
+      calloutEngagementStore: new CalloutEngagementStore(withUuid),
+    });
+    const res = await custom.inject({ method: "GET", url: "/v1/callout/leaderboard-stats/u1" });
+    assert.equal(res.statusCode, 200);
+    assert.equal(res.json().user_uuid, "uuid-from-dataset");
+  });
+
   test("GET /v1/callout/leaderboard-stats/{userId} answers with the user and windows", async () => {
     const res = await app().inject({ method: "GET", url: "/v1/callout/leaderboard-stats/u1" });
     assert.equal(res.statusCode, 200);
