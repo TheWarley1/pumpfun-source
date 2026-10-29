@@ -121,6 +121,44 @@ function requireArray(value: unknown, label: string): unknown[] {
   return value;
 }
 
+const ISO_TIMESTAMP = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,9})?Z$/;
+
+function requireString(row: Record<string, unknown>, key: string, label: string): void {
+  if (typeof row[key] !== "string" || (row[key] as string).length === 0) {
+    throw new Error(`${label}.${key} must be a non-empty string`);
+  }
+}
+
+function requireTimestamp(row: Record<string, unknown>, key: string, label: string): void {
+  requireString(row, key, label);
+  const value = row[key] as string;
+  if (!ISO_TIMESTAMP.test(value) || Number.isNaN(Date.parse(value))) {
+    throw new Error(`${label}.${key} must be an ISO 8601 UTC timestamp`);
+  }
+}
+
+/**
+ * Rows are validated here, not at request time. A snapshot that admits a row
+ * missing the fields the readers sort or filter on fails at boot; otherwise the
+ * first request would throw a TypeError out of a route instead.
+ */
+function requireRows(
+  value: unknown,
+  label: string,
+  check: (row: Record<string, unknown>, at: string) => void,
+): Record<string, unknown[]> {
+  const source = requireRecord(value, label);
+  const out: Record<string, unknown[]> = {};
+  for (const [key, rows] of Object.entries(source)) {
+    const list = requireArray(rows, `${label}.${key}`);
+    list.forEach((row, index) => {
+      check(requireRecord(row, `${label}.${key}[${index}]`), `${label}.${key}[${index}]`);
+    });
+    out[key] = list;
+  }
+  return out;
+}
+
 function mapOfArrays(value: unknown, label: string): Record<string, unknown[]> {
   const source = requireRecord(value, label);
   const out: Record<string, unknown[]> = {};
@@ -148,12 +186,33 @@ export function assertCalloutEngagementDataset(
       if (typeof entry.calloutId !== "string" || typeof entry.userId !== "string") {
         throw new Error("coinCallouts rows need calloutId and userId");
       }
+      requireTimestamp(entry, "createdAt", `coinCallouts.${coin}`);
     }
   }
 
-  mapOfArrays(root.repliesByUser, "repliesByUser");
-  mapOfArrays(root.repostsByUser, "repostsByUser");
-  requireRecord(root.leaderboardStats, "leaderboardStats");
+  requireRows(root.repliesByUser, "repliesByUser", (row, at) => {
+    requireString(row, "replyId", at);
+    requireString(row, "calloutId", at);
+    requireString(row, "userId", at);
+    requireTimestamp(row, "createdAt", at);
+  });
+  requireRows(root.repostsByUser, "repostsByUser", (row, at) => {
+    requireString(row, "id", at);
+    requireString(row, "calloutId", at);
+    requireString(row, "userId", at);
+    requireTimestamp(row, "createdAt", at);
+    if (row.kind !== "repost" && row.kind !== "quote") {
+      throw new Error(`${at}.kind must be repost or quote`);
+    }
+  });
+  const leaderboard = requireRecord(root.leaderboardStats, "leaderboardStats");
+  for (const [userId, row] of Object.entries(leaderboard)) {
+    const entry = requireRecord(row, `leaderboardStats.${userId}`);
+    requireTimestamp(entry, "snapshotAt", `leaderboardStats.${userId}`);
+    if (typeof entry.userId !== "string") {
+      throw new Error(`leaderboardStats.${userId}.userId must be a string`);
+    }
+  }
 
   const calloutLists = requireRecord(root.calloutLists, "calloutLists");
   for (const [id, lists] of Object.entries(calloutLists)) {
@@ -192,6 +251,16 @@ export interface PageQuery {
 
 const MAX_SAFE = Number.MAX_SAFE_INTEGER;
 
+/**
+ * The store owns its data. Both directions are detached: the accepted snapshot
+ * is cloned on the way in, so a caller cannot mutate a validated dataset after
+ * construction, and every row handed out is cloned on the way out, so a caller
+ * cannot mutate the snapshot by holding a reference to a response row.
+ */
+function detach<T>(value: T): T {
+  return structuredClone(value);
+}
+
 export class CalloutEngagementStore {
   readonly dataSource: CalloutEngagementDataset["dataSource"];
   readonly observedAt: string;
@@ -206,23 +275,26 @@ export class CalloutEngagementStore {
   private readonly calloutStats: Record<string, CalloutStats>;
 
   constructor(input: unknown) {
-    assertCalloutEngagementDataset(input);
-    this.dataSource = input.dataSource;
-    this.observedAt = input.observedAt;
-    this.coinCallouts = input.coinCallouts;
+    // Clone first, then validate exactly what is retained, so a caller cannot
+    // mutate a validated snapshot afterwards.
+    const accepted = detach(input);
+    assertCalloutEngagementDataset(accepted);
+    this.dataSource = accepted.dataSource;
+    this.observedAt = accepted.observedAt;
+    this.coinCallouts = accepted.coinCallouts;
     const folded: Record<string, CoinCallout[]> = {};
-    for (const [key, rows] of Object.entries(input.coinCallouts)) {
+    for (const [key, rows] of Object.entries(accepted.coinCallouts)) {
       const lower = key.toLowerCase();
       // Ambiguous collisions are dropped rather than resolved by order.
-      folded[lower] = lower in folded ? [] : rows;
+      folded[lower] = lower in folded ? [] : detach(rows);
     }
     this.coinCalloutsFold = folded;
-    this.leaderboard = input.leaderboardStats;
-    this.repliesByUser = input.repliesByUser;
-    this.repostsByUser = input.repostsByUser;
-    this.calloutLists = input.calloutLists;
-    this.replyLists = input.replyLists;
-    this.calloutStats = input.calloutStats;
+    this.leaderboard = accepted.leaderboardStats;
+    this.repliesByUser = accepted.repliesByUser;
+    this.repostsByUser = accepted.repostsByUser;
+    this.calloutLists = accepted.calloutLists;
+    this.replyLists = accepted.replyLists;
+    this.calloutStats = accepted.calloutStats;
   }
 
   /** Page a row list, rejecting an out-of-range limit or offset rather than clamping. */
@@ -248,13 +320,13 @@ export class CalloutEngagementStore {
       undefined;
     if (!rows) throw new CalloutEngagementError(404, "NOT_FOUND");
     const { rows: page } = this.page(rows, query);
-    return { callouts: page };
+    return { callouts: detach(page) };
   }
 
   leaderboardStats(userId: string): LeaderboardStats {
     const row = this.leaderboard[userId];
     if (!row) throw new CalloutEngagementError(404, "NOT_FOUND");
-    return row;
+    return detach(row);
   }
 
   repliesForUser(userId: string, query: PageQuery): { replies: CalloutReply[] } {
@@ -266,7 +338,7 @@ export class CalloutEngagementStore {
       ? sorted.filter((row) => row.replyId < query.beforeId!)
       : sorted;
     const { rows: page } = this.page(filtered, query);
-    return { replies: page };
+    return { replies: detach(page) };
   }
 
   repostsForUser(
@@ -282,7 +354,7 @@ export class CalloutEngagementStore {
     const pool = query.includeQuotes === false ? rows.filter((row) => row.kind !== "quote") : rows;
     const { rows: page, hasMore } = this.page(pool, { ...query, offset });
     return {
-      reposts: page,
+      reposts: detach(page),
       nextCursor: hasMore ? String(offset + page.length) : null,
     };
   }
@@ -293,7 +365,7 @@ export class CalloutEngagementStore {
     const rows = lists[key];
     if (!rows) throw new CalloutEngagementError(404, "NOT_FOUND");
     const { rows: page, hasMore } = this.page(rows, query);
-    return { [key]: page, hasMore } as Record<string, unknown>;
+    return { [key]: detach(page), hasMore } as Record<string, unknown>;
   }
 
   replyList(replyId: string, key: "likers" | "reposters", query: PageQuery) {
@@ -302,13 +374,13 @@ export class CalloutEngagementStore {
     const rows = lists[key];
     if (!rows) throw new CalloutEngagementError(404, "NOT_FOUND");
     const { rows: page, hasMore } = this.page(rows, query);
-    return { [key]: page, hasMore } as Record<string, unknown>;
+    return { [key]: detach(page), hasMore } as Record<string, unknown>;
   }
 
   statsFor(address: string): CalloutStats {
     const row = this.calloutStats[address.toLowerCase()] ?? this.calloutStats[address];
     if (!row) throw new CalloutEngagementError(404, "NOT_FOUND");
-    return row;
+    return detach(row);
   }
 }
 

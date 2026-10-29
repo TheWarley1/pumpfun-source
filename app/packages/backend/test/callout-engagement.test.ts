@@ -149,6 +149,56 @@ describe("callout engagement routes return their documented envelopes", () => {
   });
 });
 
+describe("the store owns an immutable, pre-validated snapshot", () => {
+  const base = () => JSON.parse(JSON.stringify(dataset));
+
+  test("a malformed reply row is rejected at construction, not at request time", () => {
+    const broken = base();
+    broken.repliesByUser.u1 = [{}, { replyId: "r9" }];
+    assert.throws(() => new CalloutEngagementStore(broken), /repliesByUser/);
+
+    const nullRow = base();
+    nullRow.repliesByUser.u1 = [null];
+    assert.throws(() => new CalloutEngagementStore(nullRow), /repliesByUser/);
+
+    const badStamp = base();
+    badStamp.repliesByUser.u1 = [
+      { replyId: "r1", calloutId: "c1", userId: "u1", createdAt: "yesterday" },
+    ];
+    assert.throws(() => new CalloutEngagementStore(badStamp), /ISO 8601/);
+  });
+
+  test("a malformed repost row and a malformed leaderboard row are rejected too", () => {
+    const badRepost = base();
+    badRepost.repostsByUser.u1 = [{ id: "p1", calloutId: "c1", userId: "u1", createdAt: "2026-10-20T00:00:00Z", kind: "like" }];
+    assert.throws(() => new CalloutEngagementStore(badRepost), /repost or quote/);
+
+    const badLeaderboard = base();
+    badLeaderboard.leaderboardStats.u1 = { userId: "u1" };
+    assert.throws(() => new CalloutEngagementStore(badLeaderboard), /snapshotAt/);
+  });
+
+  test("mutating the input dataset after construction does not change reads", () => {
+    const input = base();
+    const store = new CalloutEngagementStore(input);
+    input.coinCallouts.so111[0].userId = "tampered";
+    const read = store.coinCalloutList("so111", { limit: 10 }).callouts[0];
+    assert.equal(read.userId, "u1");
+  });
+
+  test("mutating a returned row does not change later reads", () => {
+    const store = new CalloutEngagementStore(base());
+    const first = store.coinCalloutList("so111", { limit: 10 }).callouts[0];
+    (first as unknown as { userId: string }).userId = "tampered";
+    const second = store.coinCalloutList("so111", { limit: 10 }).callouts[0];
+    assert.equal(second.userId, "u1");
+
+    const stats = store.statsFor("0xabc");
+    stats.daily.totalCallouts = 999;
+    assert.equal(store.statsFor("0xabc").daily.totalCallouts, 4);
+  });
+});
+
 describe("the three failure semantics stay distinct", () => {
   test("a row the dataset does not carry is a 404", async () => {
     const cases = [
