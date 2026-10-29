@@ -92,7 +92,7 @@ function send(
   return reply
     .header("X-Reconstruction-Data-Source", store.dataSource)
     .header("X-Reconstruction-Observed-At", store.observedAt)
-    .header("X-Reconstruction-Compatibility", "qualified")
+    .header("X-Reconstruction-Compatibility", "unqualified")
     .send(payload);
 }
 

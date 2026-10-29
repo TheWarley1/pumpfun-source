@@ -11,7 +11,7 @@
  * - The dataset is validated before the server listens, so a malformed file
  *   fails at boot rather than at the first request.
  */
-import { readFileSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
 
 export type EngagementListKey = "likers" | "reposters" | "tailers" | "quotes";
 
@@ -95,8 +95,7 @@ export type EngagementErrorCode =
   | "Q_PAGE_LIMIT"
   | "Q_PAGE_OFFSET"
   | "Q_PAGE_CURSOR"
-  | "Q_FILTER"
-  | "Q_CHAIN";
+  | "Q_FILTER";
 
 export class CalloutEngagementError extends Error {
   constructor(
@@ -198,6 +197,7 @@ export class CalloutEngagementStore {
   readonly observedAt: string;
 
   private readonly coinCallouts: Record<string, CoinCallout[]>;
+  private readonly coinCalloutsFold: Record<string, CoinCallout[]>;
   private readonly leaderboard: Record<string, LeaderboardStats>;
   private readonly repliesByUser: Record<string, CalloutReply[]>;
   private readonly repostsByUser: Record<string, CalloutRepost[]>;
@@ -210,6 +210,13 @@ export class CalloutEngagementStore {
     this.dataSource = input.dataSource;
     this.observedAt = input.observedAt;
     this.coinCallouts = input.coinCallouts;
+    const folded: Record<string, CoinCallout[]> = {};
+    for (const [key, rows] of Object.entries(input.coinCallouts)) {
+      const lower = key.toLowerCase();
+      // Ambiguous collisions are dropped rather than resolved by order.
+      folded[lower] = lower in folded ? [] : rows;
+    }
+    this.coinCalloutsFold = folded;
     this.leaderboard = input.leaderboardStats;
     this.repliesByUser = input.repliesByUser;
     this.repostsByUser = input.repostsByUser;
@@ -233,8 +240,12 @@ export class CalloutEngagementStore {
   }
 
   coinCalloutList(coin: string, query: PageQuery): { callouts: CoinCallout[] } {
-    if (query.chain !== undefined) throw new CalloutEngagementError(400, "Q_CHAIN");
-    const rows = this.coinCallouts[coin.toLowerCase()];
+    // Mint identifiers are case-sensitive in base58, so an exact key wins. The
+    // case-folded lookup is only a fallback and only when it is unambiguous.
+    const rows =
+      this.coinCallouts[coin] ??
+      this.coinCalloutsFold[coin.toLowerCase()] ??
+      undefined;
     if (!rows) throw new CalloutEngagementError(404, "NOT_FOUND");
     const { rows: page } = this.page(rows, query);
     return { callouts: page };
@@ -303,7 +314,14 @@ export class CalloutEngagementStore {
 
 /** Bounded loader for an operator-owned dataset file. */
 export function loadCalloutEngagementStore(path: string): CalloutEngagementStore {
-  const raw = readFileSync(path, "utf8");
-  if (raw.length > 8 * 1024 * 1024) throw new Error("dataset exceeds 8 MiB");
-  return new CalloutEngagementStore(JSON.parse(raw));
+  // Check the size on the file metadata, before any bytes are read.
+  const stats = statSync(path);
+  if (!stats.isFile()) throw new Error("dataset path must be a regular file");
+  const MAX_BYTES = 8 * 1024 * 1024;
+  if (stats.size > MAX_BYTES) throw new Error("dataset exceeds 8 MiB");
+  const bytes = readFileSync(path);
+  if (bytes.byteLength > MAX_BYTES) throw new Error("dataset exceeds 8 MiB");
+  return new CalloutEngagementStore(
+    JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes)),
+  );
 }

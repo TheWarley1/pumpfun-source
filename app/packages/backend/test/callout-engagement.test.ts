@@ -192,10 +192,25 @@ describe("the three failure semantics stay distinct", () => {
     }
   });
 
-  test("hasMore turns true only when more rows remain", async () => {
-    const first = await app().inject({ method: "GET", url: "/v1/callout/coin/so111?limit=2" });
-    assert.equal(first.json().hasMore ?? true, true);
-    const all = await app().inject({ method: "GET", url: "/v1/callout/coin/so111?limit=10" });
-    assert.equal(all.json().callouts.length, 3);
+  test("hasMore is true only while rows remain, on an envelope that carries it", async () => {
+    // The coin envelope has no hasMore field, so this asserts on a list that
+    // does. A coalesced default here would pass no matter what the server said.
+    const page = await app().inject({ method: "GET", url: "/v1/callout/c1/likers?limit=1" });
+    assert.equal(page.statusCode, 200);
+    assert.equal(page.json().hasMore, true);
+    assert.equal(page.json().likers.length, 1);
+
+    const whole = await app().inject({ method: "GET", url: "/v1/callout/c1/likers?limit=10" });
+    assert.equal(whole.json().hasMore, false);
+    assert.equal(whole.json().likers.length, 2);
+  });
+
+  test("coin lookup keeps base58 case and only folds when unambiguous", async () => {
+    const exact = await app().inject({ method: "GET", url: "/v1/callout/coin/so111" });
+    assert.equal(exact.statusCode, 200);
+    const folded = await app().inject({ method: "GET", url: "/v1/callout/coin/SO111" });
+    assert.equal(folded.statusCode, 200, "a case variant still resolves");
+    const missing = await app().inject({ method: "GET", url: "/v1/callout/coin/so112" });
+    assert.equal(missing.statusCode, 404);
   });
 });
